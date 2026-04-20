@@ -1,0 +1,290 @@
+# ============================================================
+# Kubernetes Deployment Manifests – AML Detection System
+# Apply with: kubectl apply -f deployment/k8s_deployment.yaml
+# ============================================================
+
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: aml-system
+  labels:
+    app.kubernetes.io/name: aml-detection
+    app.kubernetes.io/version: "1.0.0"
+
+---
+# ── ConfigMap ────────────────────────────────────────────────
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: aml-config
+  namespace: aml-system
+data:
+  LOG_LEVEL: "INFO"
+  PYTHONPATH: "/app"
+  PYTHONUNBUFFERED: "1"
+
+---
+# ── Secret (example – override with real values via CI/CD) ───
+apiVersion: v1
+kind: Secret
+metadata:
+  name: aml-secrets
+  namespace: aml-system
+type: Opaque
+stringData:
+  OPENAI_API_KEY: ""       # inject via CI/CD or Vault
+
+---
+# ── PersistentVolumeClaim – model artefacts ──────────────────
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: aml-models-pvc
+  namespace: aml-system
+spec:
+  accessModes:
+    - ReadOnlyMany
+  resources:
+    requests:
+      storage: 2Gi
+  storageClassName: standard
+
+---
+# ── API Deployment ───────────────────────────────────────────
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: aml-api
+  namespace: aml-system
+  labels:
+    app: aml-api
+    tier: inference
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: aml-api
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  template:
+    metadata:
+      labels:
+        app: aml-api
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8000"
+        prometheus.io/path: "/api/v1/metrics"
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        fsGroup: 1000
+      containers:
+        - name: aml-api
+          image: aml-detection:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8000
+              name: http
+          envFrom:
+            - configMapRef:
+                name: aml-config
+            - secretRef:
+                name: aml-secrets
+          volumeMounts:
+            - name: models
+              mountPath: /app/models
+              readOnly: true
+            - name: reports
+              mountPath: /app/reports
+              readOnly: true
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "1Gi"
+            limits:
+              cpu: "2"
+              memory: "4Gi"
+          livenessProbe:
+            httpGet:
+              path: /api/v1/health
+              port: 8000
+            initialDelaySeconds: 20
+            periodSeconds: 30
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /api/v1/health
+              port: 8000
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            failureThreshold: 3
+      volumes:
+        - name: models
+          persistentVolumeClaim:
+            claimName: aml-models-pvc
+        - name: reports
+          emptyDir: {}
+
+---
+# ── API Service ──────────────────────────────────────────────
+apiVersion: v1
+kind: Service
+metadata:
+  name: aml-api-svc
+  namespace: aml-system
+  labels:
+    app: aml-api
+spec:
+  selector:
+    app: aml-api
+  ports:
+    - name: http
+      port: 80
+      targetPort: 8000
+      protocol: TCP
+  type: ClusterIP
+
+---
+# ── Horizontal Pod Autoscaler ────────────────────────────────
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: aml-api-hpa
+  namespace: aml-system
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: aml-api
+  minReplicas: 2
+  maxReplicas: 8
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 60
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: 75
+
+---
+# ── Dashboard Deployment ─────────────────────────────────────
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: aml-dashboard
+  namespace: aml-system
+  labels:
+    app: aml-dashboard
+    tier: ui
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: aml-dashboard
+  template:
+    metadata:
+      labels:
+        app: aml-dashboard
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+      containers:
+        - name: dashboard
+          image: aml-detection:latest
+          imagePullPolicy: IfNotPresent
+          command:
+            - streamlit
+            - run
+            - dashboard/app.py
+            - --server.port=8501
+            - --server.address=0.0.0.0
+            - --server.headless=true
+            - --browser.gatherUsageStats=false
+          ports:
+            - containerPort: 8501
+              name: streamlit
+          envFrom:
+            - configMapRef:
+                name: aml-config
+          volumeMounts:
+            - name: models
+              mountPath: /app/models
+              readOnly: true
+            - name: reports
+              mountPath: /app/reports
+              readOnly: true
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "512Mi"
+            limits:
+              cpu: "1"
+              memory: "2Gi"
+      volumes:
+        - name: models
+          persistentVolumeClaim:
+            claimName: aml-models-pvc
+        - name: reports
+          emptyDir: {}
+
+---
+# ── Dashboard Service ────────────────────────────────────────
+apiVersion: v1
+kind: Service
+metadata:
+  name: aml-dashboard-svc
+  namespace: aml-system
+spec:
+  selector:
+    app: aml-dashboard
+  ports:
+    - name: streamlit
+      port: 80
+      targetPort: 8501
+  type: ClusterIP
+
+---
+# ── Ingress ──────────────────────────────────────────────────
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: aml-ingress
+  namespace: aml-system
+  annotations:
+    nginx.ingress.kubernetes.io/rewrite-target: /
+    nginx.ingress.kubernetes.io/proxy-body-size: "50m"
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: aml-api.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: aml-api-svc
+                port:
+                  number: 80
+    - host: aml-dashboard.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: aml-dashboard-svc
+                port:
+                  number: 80

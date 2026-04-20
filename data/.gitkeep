@@ -1,0 +1,3 @@
+# This directory is intentionally empty.
+# Populate it by running:  python generate_data.py
+# Files created: transactions.parquet, customers.parquet, transaction_edges.parquet

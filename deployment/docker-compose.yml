@@ -1,0 +1,73 @@
+version: "3.9"
+
+services:
+  # ── FastAPI inference API ────────────────────────────────────
+  api:
+    build:
+      context: ..
+      dockerfile: deployment/Dockerfile
+    image: aml-detection:latest
+    container_name: aml-api
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    volumes:
+      - ../data:/app/data:ro
+      - ../models:/app/models:ro
+      - ../reports:/app/reports:ro
+      - api-logs:/app/logs
+    environment:
+      - PYTHONPATH=/app
+      - LOG_LEVEL=INFO
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/api/v1/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+
+  # ── Streamlit dashboard ──────────────────────────────────────
+  dashboard:
+    build:
+      context: ..
+      dockerfile: deployment/Dockerfile
+    image: aml-detection:latest
+    container_name: aml-dashboard
+    restart: unless-stopped
+    ports:
+      - "8501:8501"
+    volumes:
+      - ../data:/app/data:ro
+      - ../models:/app/models:ro
+      - ../reports:/app/reports:ro
+    environment:
+      - PYTHONPATH=/app
+    command: >
+      streamlit run dashboard/app.py
+        --server.port 8501
+        --server.address 0.0.0.0
+        --server.headless true
+        --browser.gatherUsageStats false
+    depends_on:
+      api:
+        condition: service_healthy
+
+  # ── Pipeline runner (one-shot job) ──────────────────────────
+  pipeline:
+    build:
+      context: ..
+      dockerfile: deployment/Dockerfile
+    image: aml-detection:latest
+    container_name: aml-pipeline
+    volumes:
+      - ../data:/app/data
+      - ../models:/app/models
+      - ../reports:/app/reports
+    environment:
+      - PYTHONPATH=/app
+    command: python -m pipeline.orchestrator
+    profiles:
+      - training   # only run with: docker compose --profile training up pipeline
+
+volumes:
+  api-logs:
