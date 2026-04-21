@@ -417,14 +417,186 @@ def page_model_performance() -> None:
 # ---------------------------------------------------------------------------
 # Main entrypoint
 # ---------------------------------------------------------------------------
+def page_causal_whatif() -> None:
+    st.title("🔬 Causal What-If Analysis")
+    st.markdown(
+        "Estimate the causal impact of policy changes and simulate "
+        "counterfactual alert volumes using econometric methods."
+    )
+
+    txn_path = Path("data/transactions.parquet")
+    if not txn_path.exists():
+        st.warning("No transaction data found. Run `generate_data.py` first.")
+        return
+
+    txn_df = load_transactions()
+
+    try:
+        from causal.causal_inference import AMLCausalAnalyzer
+        analyzer = AMLCausalAnalyzer(txn_df)
+    except Exception as e:
+        st.error(f"Causal module error: {e}")
+        return
+
+    st.subheader("🎚️ What-If: Detection Threshold Change")
+    meta_path = Path("models/vae_meta.json")
+    import json as _json
+    current_threshold = (
+        _json.loads(meta_path.read_text())["threshold"]
+        if meta_path.exists() else 0.01
+    )
+
+    col1, col2 = st.columns(2)
+    with col1:
+        st.metric("Current Threshold", f"{current_threshold:.6f}")
+    with col2:
+        pct_change = st.slider("Threshold Change (%)", -50, 50, -20, 5)
+
+    new_threshold = current_threshold * (1 + pct_change / 100)
+    st.metric("New Threshold", f"{new_threshold:.6f}", delta=f"{pct_change:+.0f}%")
+
+    if st.button("▶ Run Threshold Simulation"):
+        with st.spinner("Running causal simulation …"):
+            result = analyzer.what_if_threshold(current_threshold, new_threshold)
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Baseline Alerts", f"{result.baseline_alerts:,}")
+        c2.metric("Simulated Alerts", f"{result.counterfactual_alerts:,}",
+                  delta=f"{result.delta_alerts:+,}")
+        c3.metric("Volume Change", f"${result.counterfactual_flagged_amount - result.baseline_flagged_amount:+,.0f}")
+        st.info(result.recommendation)
+
+    st.divider()
+    st.subheader("📜 What-If: New Detection Rule")
+    rule_name = st.text_input("Rule description", value="Flag PA/KY wire transfers > $5K")
+    col_a, col_b = st.columns(2)
+    with col_a:
+        affected_pct = st.slider("% of transactions affected by rule", 1, 40, 12)
+    with col_b:
+        expected_reduction = st.slider("Expected suspicious detection rate (%)", 5, 50, 20)
+
+    if st.button("▶ Simulate New Rule"):
+        with st.spinner("Simulating rule impact …"):
+            rule_result = analyzer.what_if_rule(
+                rule_name=rule_name,
+                affected_fraction=affected_pct / 100,
+                expected_reduction_pct=float(expected_reduction),
+            )
+        rc1, rc2 = st.columns(2)
+        rc1.metric("Baseline Alerts", f"{rule_result.baseline_alerts:,}")
+        rc2.metric("New Alerts", f"{rule_result.counterfactual_alerts:,}",
+                   delta=f"+{rule_result.delta_alerts:,}")
+        st.success(rule_result.recommendation)
+
+    st.divider()
+    st.subheader("📉 Causal Effect of Policy Change")
+    policy_date = st.date_input("Policy implementation date", value=pd.Timestamp("2023-07-01"))
+    if st.button("▶ Estimate Causal Effect (DiD)"):
+        with st.spinner("Running Difference-in-Differences estimation …"):
+            effect = analyzer.estimate_rule_effect(
+                rule_name="Hypothetical AML Policy Change",
+                policy_date=str(policy_date),
+                treated_column="structuring_flag",
+            )
+        ec1, ec2, ec3 = st.columns(3)
+        ec1.metric("ATE", f"{effect.ate:.4f}")
+        ec2.metric("95% CI Lower", f"{effect.ate_lower:.4f}")
+        ec3.metric("95% CI Upper", f"{effect.ate_upper:.4f}")
+        ec_col, _ = st.columns([2, 1])
+        with ec_col:
+            st.info(effect.interpretation)
+            st.caption(f"Estimator: {effect.estimator}")
+
+
+def page_duckdb_analytics() -> None:
+    st.title("🦆 DuckDB Analytics")
+    st.markdown(
+        "High-performance SQL analytics over the full Parquet dataset. "
+        "Queries run in-process without a database server."
+    )
+
+    try:
+        from data.duckdb_queries import AMLQueryEngine
+        engine = AMLQueryEngine()
+    except ImportError:
+        st.error("Install duckdb: `pip install duckdb`")
+        return
+    except Exception as e:
+        st.error(f"DuckDB error: {e}")
+        return
+
+    query_option = st.selectbox(
+        "Preset Query",
+        [
+            "Transaction Summary",
+            "Top Suspicious Customers",
+            "Daily Alert Trend",
+            "Typology Breakdown",
+            "Cross-Border Analysis",
+            "Structuring Alerts",
+            "High-Risk Network Customers",
+            "Hourly Velocity Anomalies",
+            "Custom SQL",
+        ],
+    )
+
+    preset_map = {
+        "Transaction Summary":         engine.transaction_summary,
+        "Top Suspicious Customers":    lambda: engine.top_suspicious_customers(30),
+        "Daily Alert Trend":           lambda: engine.daily_alert_trend(90),
+        "Typology Breakdown":          engine.typology_breakdown,
+        "Cross-Border Analysis":       engine.cross_border_analysis,
+        "Structuring Alerts":          engine.structuring_alerts,
+        "High-Risk Network Customers": engine.high_risk_network_customers,
+        "Hourly Velocity Anomalies":   engine.hourly_velocity_anomalies,
+    }
+
+    if query_option == "Custom SQL":
+        custom_sql = st.text_area(
+            "SQL Query",
+            value="SELECT label, COUNT(*) AS cnt FROM transactions GROUP BY label ORDER BY cnt DESC",
+            height=120,
+        )
+        if st.button("▶ Run Query"):
+            with st.spinner("Running …"):
+                try:
+                    df = engine.sql(custom_sql)
+                    st.success(f"{len(df):,} rows returned.")
+                    st.dataframe(df, use_container_width=True)
+                    st.download_button("⬇ Download", df.to_csv(index=False).encode(), "query_result.csv")
+                except Exception as exc:
+                    st.error(f"Query error: {exc}")
+    else:
+        if st.button(f"▶ Run: {query_option}"):
+            with st.spinner("Querying …"):
+                try:
+                    df = preset_map[query_option]()
+                    st.success(f"{len(df):,} rows returned.")
+                    st.dataframe(df, use_container_width=True)
+
+                    # Auto-chart for time-series queries
+                    if "date" in df.columns and "alerts" in df.columns:
+                        st.line_chart(df.set_index("date")["alerts"])
+                    elif "count" in df.columns:
+                        chart_col = df.columns[0]
+                        st.bar_chart(df.set_index(chart_col)["count"])
+
+                    st.download_button("⬇ Download", df.to_csv(index=False).encode(), f"{query_option.lower().replace(' ','_')}.csv")
+                except Exception as exc:
+                    st.error(f"Query error: {exc}")
+
+    engine.close()
+
+
 def main() -> None:
     page = sidebar()
     route_map = {
         "📊 Executive Overview": page_executive_overview,
-        "🔎 Anomaly Explorer": page_anomaly_explorer,
-        "🕸️ Network Graph": page_network_graph,
-        "📋 SAR Reports": page_sar_reports,
-        "📈 Model Performance": page_model_performance,
+        "🔎 Anomaly Explorer":   page_anomaly_explorer,
+        "🕸️ Network Graph":      page_network_graph,
+        "📋 SAR Reports":        page_sar_reports,
+        "📈 Model Performance":  page_model_performance,
+        "🔬 Causal What-If":     page_causal_whatif,
+        "🦆 DuckDB Analytics":   page_duckdb_analytics,
     }
     route_map[page]()
 

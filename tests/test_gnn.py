@@ -1,63 +1,87 @@
 """
-tests/test_gnn.py
+tests/test_gan.py
 =================
-Unit tests for the CustomerRiskGNN model.
+Unit tests for the TransactionGAN model.
 """
 
 from __future__ import annotations
 
 import pytest
 import torch
-from models.gnn import CustomerRiskGNN
+import numpy as np
+from models.gan import TransactionGAN, Generator, Discriminator
 
 
 @pytest.fixture(scope="module")
-def small_graph():
-    """Minimal graph: 10 nodes, fully-connected with self-loops."""
-    n, f = 10, 7
-    x = torch.randn(n, f)
-    src = torch.arange(n).repeat_interleave(n)
-    dst = torch.arange(n).repeat(n)
-    edge_index = torch.stack([src, dst], dim=0)
-    return x, edge_index
+def gan() -> TransactionGAN:
+    return TransactionGAN(feature_dim=9, latent_dim=16, hidden_dims_g=(32, 64), hidden_dims_d=(64, 32))
 
 
-class TestCustomerRiskGNN:
-    def test_forward_shape(self, small_graph):
-        x, edge_index = small_graph
-        model = CustomerRiskGNN(in_channels=7, hidden_channels=16, out_channels=2, heads=2)
-        logits = model(x, edge_index)
-        assert logits.shape == (10, 2), "Logits should be [N, 2]"
+@pytest.fixture(scope="module")
+def real_batch() -> torch.Tensor:
+    torch.manual_seed(0)
+    return torch.randn(32, 9)
 
-    def test_predict_proba_sums_to_one(self, small_graph):
-        x, edge_index = small_graph
-        model = CustomerRiskGNN(in_channels=7, hidden_channels=16, out_channels=2, heads=2)
-        proba = model.predict_proba(x, edge_index)
-        assert torch.allclose(proba.sum(dim=1), torch.ones(10), atol=1e-5)
 
-    def test_predict_binary(self, small_graph):
-        x, edge_index = small_graph
-        model = CustomerRiskGNN(in_channels=7, hidden_channels=16, out_channels=2, heads=2)
-        preds = model.predict(x, edge_index)
-        assert preds.shape == (10,)
-        assert set(preds.tolist()).issubset({0, 1})
+class TestGenerator:
+    def test_output_shape(self, gan, real_batch):
+        z = torch.randn(32, 16)
+        fake = gan.generator(z)
+        assert fake.shape == (32, 9)
 
-    def test_gradient_flows(self, small_graph):
-        x, edge_index = small_graph
-        model = CustomerRiskGNN(in_channels=7, hidden_channels=16, out_channels=2, heads=2)
-        model.train()
-        logits = model(x, edge_index)
-        loss = logits.sum()
+    def test_output_in_tanh_range(self, gan):
+        z = torch.randn(64, 16)
+        fake = gan.generator(z)
+        assert fake.min() >= -1.01 and fake.max() <= 1.01
+
+
+class TestDiscriminator:
+    def test_output_shape(self, gan, real_batch):
+        logits = gan.discriminator(real_batch)
+        assert logits.shape == (32, 1)
+
+    def test_anomaly_score_range(self, gan, real_batch):
+        scores = gan.discriminator.anomaly_score(real_batch)
+        assert scores.shape == (32,)
+        assert (scores >= 0).all() and (scores <= 1).all()
+
+
+class TestTransactionGAN:
+    def test_generate_shape(self, gan):
+        samples = gan.generate(50)
+        assert samples.shape == (50, 9)
+
+    def test_discriminator_loss_positive(self, gan, real_batch):
+        z = torch.randn(32, 16)
+        fake = gan.generator(z)
+        loss = gan.discriminator_loss(real_batch, fake)
+        assert loss.item() > 0
+
+    def test_generator_loss_positive(self, gan):
+        z = torch.randn(32, 16)
+        fake = gan.generator(z)
+        loss = gan.generator_loss(fake)
+        assert loss.item() > 0
+
+    def test_gradient_flows_discriminator(self, gan, real_batch):
+        z = torch.randn(32, 16)
+        fake = gan.generator(z)
+        loss = gan.discriminator_loss(real_batch, fake)
         loss.backward()
-        for name, p in model.named_parameters():
+        for name, p in gan.discriminator.named_parameters():
             if p.requires_grad:
                 assert p.grad is not None, f"No grad for {name}"
 
-    def test_dropout_off_at_eval(self, small_graph):
-        x, edge_index = small_graph
-        model = CustomerRiskGNN(in_channels=7, hidden_channels=16, out_channels=2, heads=2, dropout=0.9)
-        model.eval()
-        with torch.no_grad():
-            p1 = model.predict_proba(x, edge_index)
-            p2 = model.predict_proba(x, edge_index)
-        assert torch.allclose(p1, p2), "Predictions should be deterministic at eval"
+    def test_gradient_flows_generator(self, gan):
+        z = torch.randn(32, 16)
+        fake = gan.generator(z)
+        loss = gan.generator_loss(fake)
+        loss.backward()
+        for name, p in gan.generator.named_parameters():
+            if p.requires_grad:
+                assert p.grad is not None, f"No grad for {name}"
+
+    def test_anomaly_score_deterministic_at_eval(self, gan, real_batch):
+        s1 = gan.anomaly_score(real_batch)
+        s2 = gan.anomaly_score(real_batch)
+        assert torch.allclose(s1, s2)
