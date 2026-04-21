@@ -1,0 +1,5 @@
+{
+  "feature_dim": 9,
+  "latent_dim": 32,
+  "epochs": 60
+}
