@@ -46,6 +46,9 @@ data:
 train-vae:
 	$(PYTHON) -m agents.anomaly_detector
 
+train-gan:
+	$(PYTHON) -m agents.gan_trainer
+
 train-gnn:
 	$(PYTHON) -m agents.network_investigator
 
@@ -53,7 +56,13 @@ reports:
 	$(PYTHON) -m agents.report_writer
 
 pipeline:
-	$(PYTHON) -m pipeline.orchestrator
+	$(PYTHON) main.py pipeline
+
+demo:
+	$(PYTHON) main.py demo
+
+whatif:
+	$(PYTHON) main.py whatif
 
 # ── Services ─────────────────────────────────────────────────
 dashboard:

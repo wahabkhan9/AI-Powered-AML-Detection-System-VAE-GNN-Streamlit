@@ -1,30 +1,22 @@
 """
-models/gan.py
+models/gnn.py
 =============
-Generative Adversarial Network (GAN) for financial transaction anomaly detection.
-
-Two roles:
-  1. Generator  – produces synthetic suspicious transactions for data augmentation,
-                  helping address class imbalance in training.
-  2. Discriminator – distinguishes real-normal from generated/anomalous transactions;
-                     its confidence score becomes a second anomaly signal.
+Graph Neural Network (GNN) for customer risk classification.
 
 Architecture
 ------------
-Generator  : latent_dim → FC(128) → FC(256) → FC(feature_dim)  [tanh output]
-Discriminator : feature_dim → FC(256) → FC(128) → FC(1)          [sigmoid output]
+Two-layer Graph Attention Network (GATv2) followed by a linear classifier.
+Node features: degree, total_amount, unique_counterparties, risk_score,
+               jurisdiction_risk_encoded, avg_txn_amount, txn_count.
 
-Training
---------
-Standard min-max GAN loss:
-  D: max  E[log D(x)] + E[log(1 - D(G(z)))]
-  G: min  E[log(1 - D(G(z)))]   (or non-saturating: max E[log D(G(z))])
+The graph is a directed transaction graph where each node is a customer and
+each edge represents one or more transactions between them.
 """
 
 from __future__ import annotations
 
 import logging
-from typing import Tuple
+from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -32,158 +24,167 @@ import torch.nn.functional as F
 
 log = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------------
+# Try to import torch-geometric; provide a CPU-only fallback message.
+# ---------------------------------------------------------------------------
+try:
+    from torch_geometric.nn import GATv2Conv, global_mean_pool
+    from torch_geometric.data import Data, DataLoader as GeoDataLoader
+    _HAS_PYGEOMETRIC = True
+except ImportError:
+    _HAS_PYGEOMETRIC = False
+    log.warning(
+        "torch-geometric not installed. Using manual message-passing fallback. "
+        "Install torch-geometric for full GATv2 support."
+    )
+
 
 # ---------------------------------------------------------------------------
-# Generator
+# Manual sparse message-passing fallback (no torch-geometric dependency)
 # ---------------------------------------------------------------------------
-class Generator(nn.Module):
-    """Maps a latent noise vector z ∈ R^latent_dim to a synthetic transaction."""
+class SimpleGraphConv(nn.Module):
+    """
+    Minimal mean-aggregation graph convolution.
+    h_i^(l+1) = σ( W · MEAN({h_j : j ∈ N(i) ∪ {i}}) )
+    """
 
-    def __init__(self, latent_dim: int, feature_dim: int, hidden_dims: Tuple[int, ...] = (128, 256)) -> None:
+    def __init__(self, in_channels: int, out_channels: int) -> None:
         super().__init__()
-        layers: list[nn.Module] = []
-        in_dim = latent_dim
-        for h in hidden_dims:
-            layers += [
-                nn.Linear(in_dim, h),
-                nn.LayerNorm(h),
-                nn.LeakyReLU(0.2, inplace=True),
-            ]
-            in_dim = h
-        layers += [nn.Linear(in_dim, feature_dim), nn.Tanh()]
-        self.net = nn.Sequential(*layers)
-        self._init_weights()
+        self.linear = nn.Linear(in_channels, out_channels, bias=True)
 
-    def _init_weights(self) -> None:
-        for m in self.modules():
-            if isinstance(m, nn.Linear):
-                nn.init.xavier_normal_(m.weight)
-                if m.bias is not None:
-                    nn.init.zeros_(m.bias)
-
-    def forward(self, z: torch.Tensor) -> torch.Tensor:
-        return self.net(z)
+    def forward(
+        self, x: torch.Tensor, edge_index: torch.Tensor
+    ) -> torch.Tensor:
+        n = x.size(0)
+        # Aggregate neighbors
+        src, dst = edge_index[0], edge_index[1]
+        agg = torch.zeros_like(x)
+        count = torch.ones(n, 1, device=x.device)
+        agg.index_add_(0, dst, x[src])
+        neighbor_count = torch.zeros(n, 1, device=x.device)
+        neighbor_count.index_add_(0, dst, torch.ones(dst.size(0), 1, device=x.device))
+        neighbor_count = neighbor_count.clamp(min=1)
+        # Self + neighbour mean
+        agg = (x + agg) / (count + neighbor_count)
+        return F.leaky_relu(self.linear(agg), negative_slope=0.2)
 
 
 # ---------------------------------------------------------------------------
-# Discriminator
+# GNN model (GATv2 if torch-geometric available else SimpleGraphConv)
 # ---------------------------------------------------------------------------
-class Discriminator(nn.Module):
+class CustomerRiskGNN(nn.Module):
     """
-    Binary classifier: real-normal (1) vs generated/suspicious (0).
-    The output probability P(real) serves as an inverse anomaly score:
-    low P(real) → high anomaly likelihood.
-    """
-
-    def __init__(self, feature_dim: int, hidden_dims: Tuple[int, ...] = (256, 128)) -> None:
-        super().__init__()
-        layers: list[nn.Module] = []
-        in_dim = feature_dim
-        for h in hidden_dims:
-            layers += [
-                nn.Linear(in_dim, h),
-                nn.LayerNorm(h),
-                nn.LeakyReLU(0.2, inplace=True),
-                nn.Dropout(0.3),
-            ]
-            in_dim = h
-        layers.append(nn.Linear(in_dim, 1))   # raw logit; use BCEWithLogitsLoss
-        self.net = nn.Sequential(*layers)
-        self._init_weights()
-
-    def _init_weights(self) -> None:
-        for m in self.modules():
-            if isinstance(m, nn.Linear):
-                nn.init.xavier_normal_(m.weight)
-                if m.bias is not None:
-                    nn.init.zeros_(m.bias)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Return raw logits (shape [N, 1])."""
-        return self.net(x)
-
-    @torch.no_grad()
-    def anomaly_score(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Anomaly score = 1 - P(real).
-        Range [0, 1].  Higher → more anomalous.
-        """
-        self.eval()
-        logits = self.forward(x).squeeze(1)
-        p_real = torch.sigmoid(logits)
-        return 1.0 - p_real
-
-
-# ---------------------------------------------------------------------------
-# GAN wrapper
-# ---------------------------------------------------------------------------
-class TransactionGAN(nn.Module):
-    """
-    Wraps Generator + Discriminator with training utilities.
+    Two-layer GNN for binary node classification (suspicious / normal).
 
     Parameters
     ----------
-    feature_dim  : number of input features (must match VAE feature_dim)
-    latent_dim   : noise vector dimensionality
-    hidden_dims_g: generator hidden layer sizes
-    hidden_dims_d: discriminator hidden layer sizes
+    in_channels   : number of input node features
+    hidden_channels : width of hidden GNN layers
+    out_channels  : 2 (binary classification)
+    heads         : number of attention heads per GATv2 layer
+    dropout       : dropout probability on node embeddings
     """
 
     def __init__(
         self,
-        feature_dim: int,
-        latent_dim: int = 32,
-        hidden_dims_g: Tuple[int, ...] = (128, 256),
-        hidden_dims_d: Tuple[int, ...] = (256, 128),
+        in_channels: int,
+        hidden_channels: int = 64,
+        out_channels: int = 2,
+        heads: int = 4,
+        dropout: float = 0.3,
     ) -> None:
         super().__init__()
-        self.feature_dim = feature_dim
-        self.latent_dim = latent_dim
-        self.generator = Generator(latent_dim, feature_dim, hidden_dims_g)
-        self.discriminator = Discriminator(feature_dim, hidden_dims_d)
-        log.debug(
-            "TransactionGAN  feature_dim=%d  latent_dim=%d",
-            feature_dim, latent_dim,
+        self.dropout = dropout
+
+        if _HAS_PYGEOMETRIC:
+            self.conv1 = GATv2Conv(
+                in_channels, hidden_channels, heads=heads,
+                concat=True, dropout=dropout, add_self_loops=True,
+            )
+            self.conv2 = GATv2Conv(
+                hidden_channels * heads, hidden_channels, heads=1,
+                concat=False, dropout=dropout, add_self_loops=True,
+            )
+        else:
+            self.conv1 = SimpleGraphConv(in_channels, hidden_channels)
+            self.conv2 = SimpleGraphConv(hidden_channels, hidden_channels)
+
+        self.bn1 = nn.BatchNorm1d(hidden_channels * (heads if _HAS_PYGEOMETRIC else 1))
+        self.bn2 = nn.BatchNorm1d(hidden_channels)
+        self.classifier = nn.Sequential(
+            nn.Linear(hidden_channels, hidden_channels // 2),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_channels // 2, out_channels),
         )
+        self._init_weights()
 
     # ------------------------------------------------------------------
-    def generate(self, n: int, device: torch.device | None = None) -> torch.Tensor:
-        """Sample n synthetic transactions."""
-        device = device or next(self.generator.parameters()).device
-        z = torch.randn(n, self.latent_dim, device=device)
-        self.generator.eval()
-        with torch.no_grad():
-            return self.generator(z)
+    def _init_weights(self) -> None:
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
 
     # ------------------------------------------------------------------
-    def discriminator_loss(
+    def forward(
         self,
-        real: torch.Tensor,
-        fake: torch.Tensor,
+        x: torch.Tensor,
+        edge_index: torch.Tensor,
+        edge_weight: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
-        Standard non-saturating GAN discriminator loss with label smoothing.
-        Real labels → 0.9 (smoothed), Fake labels → 0.0.
+        Parameters
+        ----------
+        x           : [N, in_channels] node feature matrix
+        edge_index  : [2, E] COO edge list
+        edge_weight : [E] optional edge weights (ignored by fallback)
+
+        Returns
+        -------
+        logits : [N, 2] unnormalised class scores
         """
-        real_labels = torch.full((real.size(0), 1), 0.9, device=real.device)
-        fake_labels = torch.zeros(fake.size(0), 1, device=fake.device)
+        # Layer 1
+        if _HAS_PYGEOMETRIC:
+            h = self.conv1(x, edge_index)
+        else:
+            h = self.conv1(x, edge_index)
+        h = self.bn1(h)
+        h = F.leaky_relu(h, negative_slope=0.2)
+        h = F.dropout(h, p=self.dropout, training=self.training)
 
-        real_logits = self.discriminator(real)
-        fake_logits = self.discriminator(fake.detach())
+        # Layer 2
+        if _HAS_PYGEOMETRIC:
+            h = self.conv2(h, edge_index)
+        else:
+            h = self.conv2(h, edge_index)
+        h = self.bn2(h)
+        h = F.leaky_relu(h, negative_slope=0.2)
+        h = F.dropout(h, p=self.dropout, training=self.training)
 
-        d_real = F.binary_cross_entropy_with_logits(real_logits, real_labels)
-        d_fake = F.binary_cross_entropy_with_logits(fake_logits, fake_labels)
-        return (d_real + d_fake) * 0.5
-
-    # ------------------------------------------------------------------
-    def generator_loss(self, fake: torch.Tensor) -> torch.Tensor:
-        """Non-saturating generator loss: max log D(G(z))."""
-        real_labels = torch.ones(fake.size(0), 1, device=fake.device)
-        fake_logits = self.discriminator(fake)
-        return F.binary_cross_entropy_with_logits(fake_logits, real_labels)
+        return self.classifier(h)
 
     # ------------------------------------------------------------------
     @torch.no_grad()
-    def anomaly_score(self, x: torch.Tensor) -> torch.Tensor:
-        """Return per-sample anomaly scores in [0, 1]."""
-        return self.discriminator.anomaly_score(x)
+    def predict_proba(
+        self,
+        x: torch.Tensor,
+        edge_index: torch.Tensor,
+    ) -> torch.Tensor:
+        """Return softmax probability vector [N, 2]."""
+        self.eval()
+        logits = self.forward(x, edge_index)
+        return F.softmax(logits, dim=1)
+
+    # ------------------------------------------------------------------
+    @torch.no_grad()
+    def predict(
+        self,
+        x: torch.Tensor,
+        edge_index: torch.Tensor,
+        threshold: float = 0.5,
+    ) -> torch.Tensor:
+        """Return binary predictions [N]."""
+        proba = self.predict_proba(x, edge_index)
+        return (proba[:, 1] >= threshold).long()
